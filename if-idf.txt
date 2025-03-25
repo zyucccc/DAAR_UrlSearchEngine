@@ -1,0 +1,1 @@
+不单单是这样，事实上，我们api的搜索需要一个中间件，对https://gutendex.com/books/来说document都是有id的，所以当我们搜索的时候是需要一个中间件把关键词跟相应的id联系起来。我们需要建立一个index表，基于graphe bi-partie，左侧是terme，也就是单词，关键词，右侧是document的id，从1到1664比如，然后这个graphe bi-partie的arete就是基于if-idf，我们需要一个index 表，比如行是terme，列是document，格子就是计算出来的if-idf权重。在这个基础上，我们的模型还需要修改吗，是不是还需要加个id？

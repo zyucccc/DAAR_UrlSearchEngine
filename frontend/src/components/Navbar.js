@@ -37,10 +37,3 @@ function Navbar() {
 }
 
 export default Navbar;
-
-/*const handleSearch = (event) => {
-    if (event.key === "Enter") {
-      const query = encodeURIComponent(event.target.value.trim());
-      navigate(`/search_regex?regex=${query}`);
-    }
-  };  */
