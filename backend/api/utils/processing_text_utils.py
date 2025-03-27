@@ -18,17 +18,7 @@ from nltk.corpus import stopwords
 from django.db import transaction
 from queue import Queue
 
-# journal
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.FileHandler("gutendex_import.log"),
-        logging.StreamHandler()
-    ]
-)
 logger = logging.getLogger("gutendex_importer")
-
 
 # for resuming import later
 def save_import_state(state_data):

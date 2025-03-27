@@ -19,6 +19,8 @@ from django.db import transaction
 from queue import Queue
 
 from .utils.processing_text_utils import preprocess_text, preprocess_gutenberg_text, truncate_to_word_count,load_import_state, save_import_state
+from .utils.fetch_books_utils import process_single_book, process_book_terms
+from .utils.computation_tfidf_utils import calculate_tfidf_weights_parallel
 from .models import Book, Term, TermDocumentIndex, DocumentSimilarity, DocumentCentrality
 
 # journal
@@ -31,323 +33,6 @@ logging.basicConfig(
     ]
 )
 logger = logging.getLogger("gutendex_importer")
-
-# process book terms with batch processing (parallel)
-def process_book_terms(book, text, batch_size=1000):
-    tokens = preprocess_text(text)
-
-    if len(tokens) == 0:
-        logger.warning(f"book '{book.title[:30]}...' is null after preprocessing")
-        return False
-
-    # TF-Calcul
-    term_freq = Counter(tokens)
-
-    # we divide the termes into 2 groups: existing and new
-    unique_terms = list(term_freq.keys())
-    existing_terms = {term.word: term for term in Term.objects.filter(word__in=unique_terms)}
-
-    # for termes that do not exist, we create them
-    new_terms = []
-    for term in unique_terms:
-        if term not in existing_terms:
-            new_term = Term(word=term, document_count=1)
-            new_terms.append(new_term)
-            existing_terms[term] = new_term
-
-    # Parallel creation of new terms
-    if new_terms:
-        Term.objects.bulk_create(new_terms)
-
-    # update document_count for existing terms
-    terms_to_update = []
-    for term_word in existing_terms:
-        term = existing_terms[term_word]
-        if hasattr(term, 'id') and term.id is not None:  #existing term
-            term.document_count += 1
-            terms_to_update.append(term)
-
-    # Parallel update Term's document_count
-    if terms_to_update:
-        Term.objects.bulk_update(terms_to_update, ['document_count'])
-
-    # Parallel create TermDocumentIndex entries
-    index_entries = []
-    for term_word, count in term_freq.items():
-        tf = count / len(tokens)
-        index_entries.append(TermDocumentIndex(
-            term=existing_terms[term_word],
-            document=book,
-            tf=tf,
-            tfidf=0.0  # for tf-idf,we will calculate it later
-        ))
-
-
-    for i in range(0, len(index_entries), batch_size):
-        batch = index_entries[i:i+batch_size]
-        TermDocumentIndex.objects.bulk_create(batch)
-
-    return True
-
-def process_single_book(book_data, min_words=10000):
-    """Parallel processing of a single book"""
-    try:
-        # get the content URL
-        text_url = None
-        for format_key in ["text/plain", "text/plain; charset=utf-8", "text/plain; charset=us-ascii"]:
-            if format_key in book_data.get("formats", {}):
-                text_url = book_data["formats"][format_key]
-                break
-
-        if not text_url:
-            return None
-
-        # try to get the text content
-        text_response = requests.get(text_url, timeout=20)
-        if text_response.status_code != 200:
-            return None
-
-        # get the text content
-        try:
-            book_text = text_response.text
-        except UnicodeDecodeError:
-            book_text = text_response.content.decode('utf-8', errors='ignore')
-
-        # treat the text content with processing of Project Gutenberg
-        book_text = preprocess_gutenberg_text(book_text)
-
-        # clean
-        book_text = re.sub(r'\s+', ' ', book_text).strip()
-
-        # count the number of words
-        words = re.findall(r'\b[a-zA-Z]+\b', book_text)
-        word_count = len(words)
-
-        # check if it has enough words(10k)
-        if word_count >= min_words:
-            # cut the first 10k words
-            truncated_text = truncate_to_word_count(book_text, 10000)
-
-            authors = ", ".join([a["name"] for a in book_data.get("authors", [])])
-            languages = ", ".join(book_data.get("languages", []))
-            download_count = book_data.get("download_count", 0)
-            cover_url = book_data["formats"].get("image/jpeg", "")
-
-            # return intermediate result of a book,we create the book record later
-            return {
-                "title": book_data["title"],
-                "author": authors,
-                "language": languages,
-                "download_count": download_count,
-                "cover_url": cover_url,
-                "word_count": min(word_count, 10000),
-                "content": truncated_text,
-                "book_id": book_data.get("id", 0)
-            }
-
-        return None
-
-    except Exception as e:
-        logger.error(f"treat book {book_data.get('title', 'unknown')} failed: {str(e)}")
-        return None
-
-# calculate tf-idf for 1 batch
-def calculate_term_batch_tfidf(term_batch, total_docs, output_queue, batch_size=1000):
-    """
-    Parallel function to calculate TF-IDF weights for a batch of terms
-    """
-    start_time = time.time()
-    index_entries_to_update = []
-
-    term_ids = [term.id for term in term_batch]
-
-    # get term words in lowercase
-    term_words = {term.id: term.word.lower() for term in term_batch}
-
-    index_data = list(TermDocumentIndex.objects.filter(term_id__in=term_ids).values('id', 'term_id', 'tf', 'document_id'))
-
-    document_ids = [index['document_id'] for index in index_data]
-
-    # doc info
-    doc_info = {}
-    for doc in Book.objects.filter(id__in=document_ids).values('id', 'title', 'author'):
-        doc_info[doc['id']] = {
-            'title': doc['title'].lower(),
-            'author': doc['author'].lower() if doc['author'] else ''
-        }
-
-    # map term_id to Term object
-    term_map = {term.id: term for term in term_batch}
-
-    # if terme is in title or author,we will boost the tf-idf score
-    TITLE_BOOST = 1.5
-    AUTHOR_BOOST = 0.8
-
-    # treat for each index entry
-    for index in index_data:
-        term_id = index['term_id']
-        doc_id = index['document_id']
-
-        term = term_map.get(term_id)
-        if term and term.document_count > 0:
-            term_word = term_words.get(term_id, '')
-            idf = math.log(total_docs / term.document_count)
-
-            # calculate tf-idf de base
-            tfidf = index['tf'] * idf
-
-            # boost if the term is in the title
-            if doc_id in doc_info:
-                doc = doc_info[doc_id]
-
-                if term_word and term_word in doc['title']:
-                    tfidf += TITLE_BOOST
-                if term_word and term_word in doc['author']:
-                    tfidf += AUTHOR_BOOST
-
-            index_entries_to_update.append({
-                'id': index['id'],
-                'tfidf': tfidf
-            })
-
-    if index_entries_to_update:
-        output_queue.put(index_entries_to_update)
-
-    duration = time.time() - start_time
-    return len(index_entries_to_update), duration
-
-
-def calculate_tfidf_weights_parallel(request=None, batch_size=2000, term_workers=8, update_workers=4,
-                                     title_boost=1.5, author_boost=0.8):
-    """
-    Parallel function to calculate TF-IDF weights for all terms
-    """
-    start_time = time.time()
-
-    # all documents
-    total_docs = Book.objects.count()
-
-    if total_docs == 0:
-        logger.warning("No docs dispo for TF-IDF")
-        if request:
-            return JsonResponse({"error": "No docs dispo for TF-IDF"}, status=400)
-        return
-
-    logger.info("Optimize Term Table，Updating document_count...")
-    try:
-        with transaction.atomic():
-            term_counts = TermDocumentIndex.objects.values('term').annotate(doc_count=Count('document', distinct=True))
-
-            update_batches = []
-            for item in term_counts:
-                update_batches.append({
-                    'id': item['term'],
-                    'document_count': item['doc_count']
-                })
-
-            # update tf-idf by batch
-            for i in range(0, len(update_batches), batch_size):
-                batch = update_batches[i:i+batch_size]
-                objs_to_update = []
-                for item in batch:
-                    term = Term(id=item['id'])
-                    term.document_count = item['document_count']
-                    objs_to_update.append(term)
-
-                Term.objects.bulk_update(objs_to_update, ['document_count'])
-    except Exception as e:
-        logger.error(f"failed optimizing index table: {str(e)}")
-        if request:
-            return JsonResponse({"error": f"failed optimizing index table: {str(e)}"}, status=500)
-        raise e
-
-    logger.info(f"Boost factor for title: {title_boost}, Boost factor for author: {author_boost}")
-
-    # terms in total
-    total_terms = Term.objects.count()
-    logger.info(f"Starting calculating {total_terms} tf-idf weights ，using {term_workers} workers")
-
-    # queue
-    result_queue = Queue()
-
-    # treatment by batch
-    all_term_batches = []
-    for i in range(0, total_terms, batch_size):
-        term_batch = list(Term.objects.all()[i:i+batch_size])
-        all_term_batches.append(term_batch)
-
-    # process parallel
-    global TITLE_BOOST, AUTHOR_BOOST
-    TITLE_BOOST = title_boost
-    AUTHOR_BOOST = author_boost
-
-    process_batch = partial(calculate_term_batch_tfidf, total_docs=total_docs, output_queue=result_queue, batch_size=batch_size)
-
-    # calculate tf-idf for each batch of terms
-    processed_terms = 0
-    total_entries = 0
-
-    with ThreadPoolExecutor(max_workers=term_workers) as executor:
-        futures = [executor.submit(process_batch, term_batch) for term_batch in all_term_batches]
-        for future in as_completed(futures):
-            try:
-                entries_count, duration = future.result()
-                processed_terms += len(all_term_batches[futures.index(future)])
-                total_entries += entries_count
-                logger.info(f"Treated {processed_terms}/{total_terms} Terms ({processed_terms/total_terms*100:.1f}%)，generated {entries_count} index entrys，duration {duration:.2f}second")
-            except Exception as e:
-                logger.error(f"failed when treat terms: {str(e)}")
-
-    # collect all entries to update
-    all_entries_to_update = []
-    while not result_queue.empty():
-        entries = result_queue.get()
-        all_entries_to_update.extend(entries)
-
-    logger.info(f"Starting updating {len(all_entries_to_update)} index-entris TFIDF value")
-
-    logger.info("reset all old tf-idf as 0...")
-    with transaction.atomic():
-        TermDocumentIndex.objects.update(tfidf=0.0)
-
-    # update by batch
-    update_batch_size = batch_size * 2
-    update_start_time = time.time()
-
-    for i in range(0, len(all_entries_to_update), update_batch_size):
-        batch = all_entries_to_update[i:i+update_batch_size]
-
-        objs_to_update = []
-        for item in batch:
-            idx = TermDocumentIndex(id=item['id'])
-            idx.tfidf = item['tfidf']
-            objs_to_update.append(idx)
-
-        with transaction.atomic():
-            TermDocumentIndex.objects.bulk_update(objs_to_update, ['tfidf'])
-
-        progress = min((i + update_batch_size) / len(all_entries_to_update), 1.0) * 100
-        logger.info(f"Updated {progress:.1f}% tf-idf")
-
-    update_duration = time.time() - update_start_time
-    total_duration = time.time() - start_time
-
-    logger.info(f"TF-IDF computation finished！Treated {total_terms} Terms，updated {len(all_entries_to_update)} index entris")
-    logger.info(f"computation duration: {update_start_time - start_time:.2f}second，update duration: {update_duration:.2f}second")
-    logger.info(f"duration in total: {total_duration:.2f}秒")
-
-    if request:
-        return JsonResponse({
-            "message": "tf-idf calculated finished",
-            "terms_processed": total_terms,
-            "entries_updated": len(all_entries_to_update),
-            "title_boost": title_boost,
-            "author_boost": author_boost,
-            "total_duration_seconds": total_duration
-        })
-
-    return total_terms, len(all_entries_to_update), total_duration
-
 
 ##################################################################
 #####                                                        #####
@@ -374,7 +59,7 @@ def calculate_tfidf(request):
 
 ##################################################################
 #####                                                        #####
-#####    fetch 1664 documents(>10k mots) from Gutendex API   #####
+#####    fetch 1664 documents(~10k mots) from Gutendex API   #####
 #####                                                        #####
 ##################################################################
 def fetch_books_from_gutendex(request):
@@ -569,7 +254,7 @@ def search_books(request):
         return regex_search_books(request)
 
 
-    min_score = float(request.GET.get("min_score", "0.0001"))
+    min_score = float(request.GET.get("min_score", "0.001"))
 
     if not query:
         return JsonResponse({"error": "pls fournir le mot cle"}, status=400)
@@ -641,8 +326,21 @@ def search_books(request):
     sorted_results = classement(document_details_list)
 
     logger.info(f"Search '{query}' find {len(sorted_results)} results，TF-IDF threshold: {min_score}")
+    response_data = {
+        "results": sorted_results,
+    }
 
-    return JsonResponse(sorted_results, safe=False)
+    if sorted_results:
+        logger.info(f"generating '{query}' for recommendations")
+        recommendations = get_document_suggestions(
+            sorted_results
+        )
+
+        if recommendations:
+            response_data["suggestions"] = recommendations
+            logger.info(f"for '{query}' generated  {len(recommendations)} recommendations")
+
+    return JsonResponse(response_data, safe=False)
 
 ##################################################################
 #####                                                        #####
@@ -733,7 +431,21 @@ def regex_search_books(request):
     document_details_list = list(document_details.values())
     sorted_results = classement(document_details_list)
 
-    return JsonResponse(sorted_results,safe=False)
+    response_data = {
+        "results": sorted_results,
+    }
+
+    if sorted_results:
+        logger.info(f"generating '{regex_query}' for recommendations")
+        recommendations = get_document_suggestions(
+            sorted_results
+        )
+
+        if recommendations:
+            response_data["suggestions"] = recommendations
+            logger.info(f"for '{regex_query}' generated {len(recommendations)} recommendations")
+
+    return JsonResponse(response_data,safe=False)
 
 
 ##################################################################
@@ -1031,7 +743,11 @@ def calculate_centrality_scores(request=None, centrality_type='closeness', min_s
 
     return len(centrality_scores), duration
 
-""" ----------------- Classement des livres avec PageRank -----------------"""
+##################################################################
+#####                                                        #####
+#####                     Classement                         #####
+#####                                                        #####
+##################################################################
 def classement(search_results, centrality_type='all', centrality_weight=0.3):
     """
     classement des livres en fonction de la centralité et du score TF-IDF
@@ -1212,23 +928,173 @@ def _calculate_adaptive_weight(tfidf_norm, base_weight):
     else:
         return min(base_weight * 1.2, 0.5)
 
-""" ------------------ Suggestion basée sur la similarité de Jaccard -------------------- """
+##################################################################
+#####                                                        #####
+##### Recommendation basée sur la similarité de Jaccard      #####
+#####                                                        #####
+##################################################################
+def get_document_suggestions(search_results, top_k=3, max_per_doc=2, max_suggestions=5, min_similarity=0.15):
+    """
+    pour les k meilleurs résultats de recherche, nous recommandons les documents les plus similaires
+    - search_results
+    - top_k: les k meilleurs résultats de recherche
+    - max_per_doc: nb de voisins les plus proches à recommander pour chaque document
+    - max_suggestions:
+    - min_similarity:
+    """
+    if not search_results or len(search_results) == 0:
+        return []
 
-def suggest_books(request):
-    books = Book.objects.all()
-    G = nx.Graph()
+    # get les ID des k le plus meilleurs documents de recherche
+    top_doc_ids = [doc['id'] for doc in search_results[:min(top_k, len(search_results))]]
 
-    for book in books:
-        G.add_node(book.title)
+    if not top_doc_ids:
+        return []
 
-    for book1 in books:
-        for book2 in books:
-            if book1.author == book2.author and book1.title != book2.title:
-                G.add_edge(book1.title, book2.title)
+    logger.info(f"start generating {len(top_doc_ids)}recommendations for: {top_doc_ids}")
 
-    suggestions = {}
-    for book in books:
-        neighbors = list(G.neighbors(book.title))
-        suggestions[book.title] = neighbors
+    # les voisins de Jaccard
+    similar_docs_query = DocumentSimilarity.objects.filter(
+        (Q(document1_id__in=top_doc_ids) | Q(document2_id__in=top_doc_ids)),
+        jaccard_similarity__gte=min_similarity
+    ).values('document1_id', 'document2_id', 'jaccard_similarity')
 
-    return JsonResponse(suggestions, safe=False)
+    # Structure: {source_id {recommendation_doc_id: {similarity, source_doc_id}}}
+    recommendations_by_source = {doc_id: {} for doc_id in top_doc_ids}
+
+    for relation in similar_docs_query:
+        doc1_id = relation['document1_id']
+        doc2_id = relation['document2_id']
+        similarity = relation['jaccard_similarity']
+
+        # check which one is source and which one is recommendation
+        if doc1_id in top_doc_ids and doc2_id not in top_doc_ids:
+            # doc1 source
+            if doc2_id not in recommendations_by_source[doc1_id] or similarity > recommendations_by_source[doc1_id][doc2_id]['similarity']:
+                recommendations_by_source[doc1_id][doc2_id] = {
+                    'similarity': similarity,
+                    'source_doc_id': doc1_id
+                }
+        elif doc2_id in top_doc_ids and doc1_id not in top_doc_ids:
+            # doc2 source
+            if doc1_id not in recommendations_by_source[doc2_id] or similarity > recommendations_by_source[doc2_id][doc1_id]['similarity']:
+                recommendations_by_source[doc2_id][doc1_id] = {
+                    'similarity': similarity,
+                    'source_doc_id': doc2_id
+                }
+
+    # check if we have at least 1 recommendations
+    has_recommendations = any(len(recs) > 0 for recs in recommendations_by_source.values())
+    if not has_recommendations:
+        logger.info(f"not found higher than {min_similarity} recommendations")
+        return []
+
+    # delete duplicates in search results
+    result_doc_ids = {doc['id'] for doc in search_results}
+
+    all_recommendations = {}
+
+    # pick the top max_per_doc recommendations for each source
+    for source_id, recommendations in recommendations_by_source.items():
+        filtered_recommendations = {rec_id: data for rec_id, data in recommendations.items()
+                                    if rec_id not in result_doc_ids}
+
+        # trier par similarity
+        sorted_recommendations = sorted(
+            filtered_recommendations.items(),
+            key=lambda x: x[1]['similarity'],
+            reverse=True
+        )[:max_per_doc]
+
+        for rec_id, data in sorted_recommendations:
+            if rec_id not in all_recommendations or data['similarity'] > all_recommendations[rec_id]['similarity']:
+                all_recommendations[rec_id] = data
+
+    # si le nombre total de recommandations dépasse max_suggestions, trier par similarité
+    if len(all_recommendations) > max_suggestions:
+        sorted_recommendations = sorted(
+            all_recommendations.items(),
+            key=lambda x: x[1]['similarity'],
+            reverse=True
+        )[:max_suggestions]
+        all_recommendations = {rec_id: data for rec_id, data in sorted_recommendations}
+
+    if not all_recommendations:
+        return []
+
+    # details des recommandations
+    recommendation_ids = list(all_recommendations.keys())
+    recommendations = list(Book.objects.filter(id__in=recommendation_ids).values(
+        'id', 'title', 'author', 'language', 'download_count', 'cover_url', 'word_count','content'
+    ))
+
+    for recommendation in recommendations:
+        doc_id = recommendation['id']
+        similarity_info = all_recommendations[doc_id]
+        recommendation['similarity_score'] = similarity_info['similarity']
+
+        # pick source document info
+        source_doc_id = similarity_info['source_doc_id']
+        source_doc = next((doc for doc in search_results if doc['id'] == source_doc_id), None)
+        if source_doc:
+            recommendation['recommended_based_on'] = {
+                'id': source_doc_id,
+                'title': source_doc['title']
+            }
+
+    # trier par similarite
+    recommendations.sort(key=lambda x: x['similarity_score'], reverse=True)
+
+    logger.info(f"generated {len(recommendations)} recommendations")
+    return recommendations
+
+##################################################################
+#####                                                        #####
+#####          API for single book detail dans frontend      #####
+#####                                                        #####
+##################################################################
+def get_book_detail(request, book_id):
+    try:
+        book = Book.objects.get(id=book_id)
+
+        # Prepare the book data
+        book_data = {
+            'id': book.id,
+            'title': book.title,
+            'author': book.author,
+            'language': book.language,
+            'download_count': book.download_count,
+            'cover_url': book.cover_url,
+            'word_count': book.word_count,
+            'content': book.content,
+        }
+
+        related_books = []
+        try:
+            similar_docs = DocumentSimilarity.objects.filter(
+                Q(document1_id=book_id) | Q(document2_id=book_id)
+            ).order_by('-jaccard_similarity')[:5]
+
+            for sim in similar_docs:
+                related_id = sim.document2_id if sim.document1_id == book_id else sim.document1_id
+                related_book = Book.objects.get(id=related_id)
+
+                related_books.append({
+                    'id': related_book.id,
+                    'title': related_book.title,
+                    'author': related_book.author,
+                    'similarity': sim.jaccard_similarity
+                })
+
+            book_data['related_books'] = related_books
+        except Exception as e:
+            logger.error(f"Error fetching related books: {str(e)}")
+
+        return JsonResponse(book_data)
+
+    except Book.DoesNotExist:
+        return JsonResponse({"error": "Livre non trouvé"}, status=404)
+
+    except Exception as e:
+        logger.error(f"Error fetching book detail: {str(e)}")
+        return JsonResponse({"error": f"Erreur serveur: {str(e)}"}, status=500)

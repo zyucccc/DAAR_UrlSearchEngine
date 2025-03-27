@@ -1,5 +1,10 @@
 from django.db import models
 
+##################################################################
+#####                                                        #####
+#####                    Document + Mot                      #####
+#####                                                        #####
+##################################################################
 class Book(models.Model):
     """Document - 1664 docs in total"""
     title = models.CharField(max_length=255)
@@ -21,6 +26,12 @@ class Term(models.Model):
     def __str__(self):
         return self.word
 
+
+##################################################################
+#####                                                        #####
+#####        Weight Index Table (Terme <-TFIDF-> Doc)        #####
+#####                                                        #####
+##################################################################
 class TermDocumentIndex(models.Model):
     """Index Table - Terme ->DoC->Score TF_IDF"""
     term = models.ForeignKey(Term, on_delete=models.CASCADE)
@@ -36,7 +47,11 @@ class TermDocumentIndex(models.Model):
             models.Index(fields=['document']),
         ]
 
-
+##################################################################
+#####                                                        #####
+#####         Jaccard distance Table (Doc <-> Doc)           #####
+#####                                                        #####
+##################################################################
 class DocumentSimilarity(models.Model):
     """Jaccard - Similarity entre 2 doc"""
     document1 = models.ForeignKey(Book, related_name='similarities_as_doc1', on_delete=models.CASCADE)
@@ -53,7 +68,11 @@ class DocumentSimilarity(models.Model):
     def __str__(self):
         return f"{self.document1.title} - {self.document2.title}: {self.jaccard_similarity}"
 
-
+#############################################################################################
+#####                                                                                   #####
+#####     Centralite non-oriente graph score (Sommet:Doc,Arete:1/Jaccard_Distance)      #####
+#####                                                                                   #####
+#############################################################################################
 class DocumentCentrality(models.Model):
     """Centrality entre des docs - closeness'"""
     document = models.ForeignKey(Book, on_delete=models.CASCADE)

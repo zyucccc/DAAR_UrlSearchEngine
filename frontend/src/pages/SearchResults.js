@@ -1,6 +1,7 @@
 import React, { useEffect, useState } from "react";
 import { useLocation } from "react-router-dom";
 import BookCard from "../components/BookCard";
+import BookRecommendations from "../components/BookRecommendations";
 
 function useQuery() {
   return new URLSearchParams(useLocation().search);
@@ -8,7 +9,9 @@ function useQuery() {
 
 function SearchResults() {
   const query = useQuery().get("q");
-  const [books, setBooks] = useState([]);
+  // const [books, setBooks] = useState([]);
+  const [results, setResults] = useState([]);
+  const [suggestions, setSuggestions] = useState([]);
   const [error, setError] = useState("");
   const [isLoading,setIsLoading] = useState(false);
 
@@ -16,7 +19,9 @@ function SearchResults() {
     if (query) {
       const fetchBooks = async () => {
         setError("");  
-        setBooks([]);
+        // setBooks([]);
+        setResults([]);
+        setSuggestions([]);
         setIsLoading(true);
         
         const encodedQuery = encodeURIComponent(query);
@@ -27,9 +32,14 @@ function SearchResults() {
           const data = await response.json();
 
           if (response.ok) {
-            setBooks(data);  // Met à jour la liste des livres
+            // setBooks(data);  // Met à jour la liste des livres
+            setResults(data.results);
+            if (data.suggestions) {
+              setSuggestions(data.suggestions);
+            }
           } else {
-            setBooks([]);
+            // setBooks([]);
+            setResults([]);
             setError(data.error || "Aucun livre trouvé.");
           }
         } catch (err) {
@@ -45,7 +55,7 @@ function SearchResults() {
   }, [query]);
 
   return (
-    <div className="container py-10">
+    <div className="container py-10 pb-32">
       <h1 className="text-2xl font-bold">Résultats pour "{query}"</h1>
 
       {error && (
@@ -63,7 +73,7 @@ function SearchResults() {
           </div>
       ) : (
           //result == vide
-          books.length === 0 && !error && (
+          results.length === 0 && !error && (
               <p className="text-center text-gray-500 mt-6">
                 Aucun livre trouvé pour "<span className="font-bold">{query}</span>". <br />
                 Essayez un autre mot-clé ou une variante !
@@ -72,10 +82,12 @@ function SearchResults() {
       )}
 
       <div className="grid grid-cols-3 gap-6 mt-6">
-        {books.map((book, index) => (
+        {results.map((book, index) => (
             <BookCard key={index} book={book} />
         ))}
       </div>
+      {/* recommendation */}
+      {suggestions.length > 0 && <BookRecommendations suggestions={suggestions} />}
     </div>
   );
 }
