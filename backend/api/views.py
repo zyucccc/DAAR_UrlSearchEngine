@@ -18,7 +18,7 @@ from nltk.corpus import stopwords
 from django.db import transaction
 from queue import Queue
 
-
+from .utils.processing_text_utils import preprocess_text, preprocess_gutenberg_text, truncate_to_word_count,load_import_state, save_import_state
 from .models import Book, Term, TermDocumentIndex, DocumentSimilarity, DocumentCentrality
 
 # journal
@@ -31,114 +31,6 @@ logging.basicConfig(
     ]
 )
 logger = logging.getLogger("gutendex_importer")
-
-# for resuming import later
-def save_import_state(state_data):
-    """save import state to a JSON file,for resuming later"""
-    with open('import_state.json', 'w') as f:
-        json.dump(state_data, f)
-    logger.info(f"Save import state：already treated {state_data['books_imported']} books")
-
-def load_import_state():
-    """load import state from a JSON file,for resuming import"""
-    try:
-        if os.path.exists('import_state.json'):
-            with open('import_state.json', 'r') as f:
-                state = json.load(f)
-            logger.info(f"load import state：last time imported {state['books_imported']} books，final urls is {state['last_url']}")
-            return state
-        return None
-    except Exception as e:
-        logger.error(f"load import state failed：{str(e)}")
-        return None
-
-
-def download_nltk_resources():
-    try:
-        nltk.data.find('tokenizers/punkt')
-        nltk.data.find('corpora/stopwords')
-    except LookupError:
-        nltk.download('punkt')
-        nltk.download('stopwords')
-
-def preprocess_text(text):
-    """preprocess text：lowercase,tokenize,remove stopwords and non-alphabetic characters"""
-    download_nltk_resources()
-
-    # lowercase and remove non-alphabetic characters
-    text = text.lower()
-    text = re.sub(r'[^a-z0-9\s]', '', text)
-
-    # tokenize
-    tokens = word_tokenize(text)
-
-    # remove stopwords and short words
-    stop_words = set(stopwords.words('english'))
-    filtered_tokens = [word for word in tokens if word not in stop_words and len(word) > 1]
-
-    return filtered_tokens
-
-def preprocess_gutenberg_text(text):
-    """to process text from Project Gutenberg"""
-
-    # try to extract the main content part
-    start_markers = [
-        "*** START OF THE PROJECT GUTENBERG EBOOK",
-        "*** START OF THIS PROJECT GUTENBERG EBOOK",
-        "*END*THE SMALL PRINT",
-        "*** START OF THE PROJECT GUTENBERG",
-        "***START OF THE PROJECT GUTENBERG",
-        "This eBook is for the use of anyone"
-    ]
-
-    end_markers = [
-        "*** END OF THE PROJECT GUTENBERG EBOOK",
-        "*** END OF THIS PROJECT GUTENBERG EBOOK",
-        "End of the Project Gutenberg EBook",
-        "*** END OF THE PROJECT GUTENBERG",
-        "***END OF THE PROJECT GUTENBERG",
-        "End of Project Gutenberg"
-    ]
-
-    # we cut the text between the start and end markers
-    main_content = text
-
-    # find start marker
-    start_pos = -1
-    for marker in start_markers:
-        pos = text.find(marker)
-        if pos != -1:
-            line_end = text.find('\n', pos)
-            if line_end != -1:
-                start_pos = line_end + 1
-            break
-
-    # find end marker
-    end_pos = -1
-    for marker in end_markers:
-        pos = text.rfind(marker)
-        if pos != -1:
-            end_pos = pos
-            break
-
-    # cut the text
-    if start_pos != -1 and end_pos != -1 and start_pos < end_pos:
-        main_content = text[start_pos:end_pos]
-    elif start_pos != -1:
-        main_content = text[start_pos:]
-
-    # clean
-    main_content = re.sub(r'\r\n', '\n', main_content)
-    main_content = re.sub(r'\n{3,}', '\n\n', main_content)
-
-    return main_content
-
-# we cut only the first 10k words for each book
-def truncate_to_word_count(text, target_words=10000):
-    words = text.split()
-    if len(words) <= target_words:
-        return text
-    return ' '.join(words[:target_words])
 
 # process book terms with batch processing (parallel)
 def process_book_terms(book, text, batch_size=1000):
@@ -702,7 +594,7 @@ def search_books(request):
         tfidf__gt=min_score
     ).values('document', 'document__title', 'document__author', 'document__language',
              'document__download_count', 'document__cover_url', 'document__word_count',
-             'term__word', 'tfidf')
+             'term__word','document__content', 'tfidf')
 
     if not matching_indices:
         return JsonResponse({"error": f"didnt find result which have higher score than {min_score}"}, status=404)
@@ -724,6 +616,7 @@ def search_books(request):
                 'download_count': idx['document__download_count'],
                 'cover_url': idx['document__cover_url'],
                 'word_count': idx['document__word_count'],
+                'content': idx['document__content'],
                 'matched_terms': [],
                 'total_score': 0
             }
@@ -737,11 +630,15 @@ def search_books(request):
     for doc_id in document_scores:
         document_details[doc_id]['total_score'] = document_scores[doc_id]
 
-    sorted_results = sorted(
-        document_details.values(),
-        key=lambda x: x['total_score'],
-        reverse=True
-    )
+    # sorted_results = sorted(
+    #     document_details.values(),
+    #     key=lambda x: x['total_score'],
+    #     reverse=True
+    # )
+    # Trier les résultats par classement
+    logger.info(f"Start sorting results by TF-IDF score + centrality,defaut setting: Avg score for centrality + 0.3 weight")
+    document_details_list = list(document_details.values())
+    sorted_results = classement(document_details_list)
 
     logger.info(f"Search '{query}' find {len(sorted_results)} results，TF-IDF threshold: {min_score}")
 
@@ -791,7 +688,7 @@ def regex_search_books(request):
     ).values(
         'document', 'document__title', 'document__author', 'document__language',
         'document__download_count', 'document__cover_url', 'document__word_count',
-        'term__word', 'tfidf'
+        'term__word', 'document__content','tfidf'
     )
 
     if not matching_indices:
@@ -815,6 +712,7 @@ def regex_search_books(request):
                 'download_count': idx['document__download_count'],
                 'cover_url': idx['document__cover_url'],
                 'word_count': idx['document__word_count'],
+                'content': idx['document__content'],
                 'matched_terms': {},
                 'total_score': 0
             }
@@ -825,23 +723,16 @@ def regex_search_books(request):
     for doc_id in document_scores:
         document_details[doc_id]['total_score'] = round(document_scores[doc_id], 4)
 
-    sorted_results = sorted(
-        document_details.values(),
-        key=lambda x: x['total_score'],
-        reverse=True
-    )
+    # sorted_results = sorted(
+    #     document_details.values(),
+    #     key=lambda x: x['total_score'],
+    #     reverse=True
+    # )
+    # Trier les résultats par classement
+    logger.info(f"Start sorting results by TF-IDF score + centrality,defaut setting: Avg score for centrality + 0.3 weight")
+    document_details_list = list(document_details.values())
+    sorted_results = classement(document_details_list)
 
-    stats = {
-        'regex_query': regex_query,
-        'matched_terms': matched_words,
-        'result_count': len(sorted_results),
-        'min_score': min_score
-    }
-
-    # return JsonResponse({
-    #     'stats': stats,
-    #     'results': sorted_results
-    # }, safe=False)
     return JsonResponse(sorted_results,safe=False)
 
 
@@ -1141,24 +1032,185 @@ def calculate_centrality_scores(request=None, centrality_type='closeness', min_s
     return len(centrality_scores), duration
 
 """ ----------------- Classement des livres avec PageRank -----------------"""
+def classement(search_results, centrality_type='all', centrality_weight=0.3):
+    """
+    classement des livres en fonction de la centralité et du score TF-IDF
+    Normalement, on normalise le score TF-IDF et le score de centralité entre 0 et 1
+    et apres on combine les deux scores en utilisant un poids(par defaut, 0,7pour TF-IDF et 0,3 pour centralité)
+    - search_results
+    - centrality_type:
+       - 'best': by priority, closeness > betweenness > pagerank
+       - 'closeness', 'betweenness', 'pagerank': we use the specified centrality type
+       - 'all': AVG of all centrality types
+    - centrality_weight: weight for centrality score, default 0.3
+    """
+    if not search_results:
+        return []
 
-def rank_books(request):
-    books = Book.objects.all()
-    G = nx.Graph()
+    doc_ids = [doc['id'] for doc in search_results]
+    # get total td-idf score
+    document_scores = {doc['id']: doc.get('total_score', 0) for doc in search_results}
 
-    for book in books:
-        G.add_node(book.title, download_count=book.download_count)
+    # get all available centrality types
+    available_centrality_types = list(DocumentCentrality.objects.filter(
+        document_id__in=doc_ids
+    ).values_list('centrality_type', flat=True).distinct())
 
-    for book1 in books:
-        for book2 in books:
-            if book1.author == book2.author and book1.title != book2.title:
-                G.add_edge(book1.title, book2.title)
+    if not available_centrality_types:
+        logger.warning("not found any centrality type")
+        return search_results
 
-    pagerank = nx.pagerank(G)
-    ranked_books = sorted(books, key=lambda b: pagerank.get(b.title, 0), reverse=True)
+    # moyen1: by priority, closeness > betweenness > pagerank
+    if centrality_type == 'best':
+        if 'closeness' in available_centrality_types:
+            centrality_type = 'closeness'
+        elif 'betweenness' in available_centrality_types:
+            centrality_type = 'betweenness'
+        elif 'pagerank' in available_centrality_types:
+            centrality_type = 'pagerank'
+        else:
+            centrality_type = available_centrality_types[0]
 
-    data = [{"title": b.title, "author": b.author, "score": pagerank.get(b.title, 0)} for b in ranked_books]
-    return JsonResponse(data, safe=False)
+        logger.info(f"we pick the centrality by priority,closeness > betweenness > pagerank: {centrality_type}")
+
+    # moyen2: on calculate the avg of all centrality types
+    if centrality_type == 'all':
+        # get all centrality scores
+        centrality_records = DocumentCentrality.objects.filter(
+            document_id__in=doc_ids
+        ).values('document_id', 'centrality_type', 'score')
+
+        centrality_scores = {}
+        for record in centrality_records:
+            doc_id = record['document_id']
+            c_type = record['centrality_type']
+            score = record['score']
+
+            if doc_id not in centrality_scores:
+                centrality_scores[doc_id] = {}
+
+            centrality_scores[doc_id][c_type] = score
+    else:
+        centrality_records = DocumentCentrality.objects.filter(
+            document_id__in=doc_ids,
+            centrality_type=centrality_type
+        ).values('document_id', 'score')
+
+        centrality_scores = {record['document_id']: record['score'] for record in centrality_records}
+
+    # Normalise TF-IDF A [0,1]
+    max_tfidf = max(document_scores.values()) if document_scores else 1.0
+    normalized_tfidf = {
+        doc_id: score / max_tfidf if max_tfidf > 0 else 0.0
+        for doc_id, score in document_scores.items()
+    }
+
+    combined_scores = {}
+
+    if centrality_type == 'all':
+        # for each type of centrality, we calculate the average score
+        for doc_id in doc_ids:
+            if doc_id not in centrality_scores:
+                combined_scores[doc_id] = normalized_tfidf.get(doc_id, 0)
+                continue
+
+            # Normalise centrality scores
+            normalized_centralities = {}
+            for c_type in available_centrality_types:
+                if c_type not in centrality_scores[doc_id]:
+                    continue
+
+                c_scores = [centrality_scores[d_id].get(c_type, 0) for d_id in centrality_scores if c_type in centrality_scores[d_id]]
+                if not c_scores:
+                    continue
+
+                max_c = max(c_scores)
+                min_c = min(c_scores)
+                range_c = max_c - min_c
+
+                if range_c > 0:
+                    normalized_centralities[c_type] = (centrality_scores[doc_id][c_type] - min_c) / range_c
+                else:
+                    normalized_centralities[c_type] = 0.5
+
+            # AVG of all centrality types
+            if normalized_centralities:
+                avg_centrality = sum(normalized_centralities.values()) / len(normalized_centralities)
+
+                tfidf_norm = normalized_tfidf.get(doc_id, 0.0)
+                weight = _calculate_adaptive_weight(tfidf_norm, centrality_weight)
+                logger.info(f"Classment: for document: {Book.objects.get(id=doc_id).title}")
+                logger.info("Classment: After normalising,tfidf_norm: {},AVG_centrality_norm: {},weight: {}".format(tfidf_norm, avg_centrality, weight))
+                combined_scores[doc_id] = (1 - weight) * tfidf_norm + weight * avg_centrality
+            else:
+                combined_scores[doc_id] = normalized_tfidf.get(doc_id, 0)
+    else:
+        # for one type of centrality, we use the score directly(Normalise)
+        max_centrality = max(centrality_scores.values()) if centrality_scores else 1.0
+        min_centrality = min(centrality_scores.values()) if centrality_scores else 0.0
+        range_centrality = max_centrality - min_centrality
+
+        normalized_centrality = {}
+        if range_centrality > 0:
+            normalized_centrality = {
+                doc_id: (score - min_centrality) / range_centrality
+                for doc_id, score in centrality_scores.items()
+            }
+        else:
+            normalized_centrality = {doc_id: 0.5 for doc_id in centrality_scores}
+
+        # calculate the combined score by multiplying the normalized scores and the adaptive weight
+        for doc_id in doc_ids:
+            tfidf_norm = normalized_tfidf.get(doc_id, 0.0)
+            centrality_norm = normalized_centrality.get(doc_id, 0.0)
+
+            weight = _calculate_adaptive_weight(tfidf_norm, centrality_weight)
+
+            combined_scores[doc_id] = (1 - weight) * tfidf_norm + weight * centrality_norm
+
+    # update search results with combined scores
+    for doc in search_results:
+        doc_id = doc['id']
+        doc['tfidf_score'] = document_scores.get(doc_id, 0)
+
+        if centrality_type == 'all':
+            # "All" centrality types
+            if doc_id in centrality_scores:
+                doc['centrality_scores'] = centrality_scores[doc_id]
+            else:
+                doc['centrality_scores'] = {}
+        else:
+            doc['centrality_type'] = centrality_type
+            doc['centrality_score'] = centrality_scores.get(doc_id, 0)
+
+        doc['combined_score'] = combined_scores.get(doc_id, 0)
+
+    # Trier par combined_score
+    sorted_results = sorted(search_results, key=lambda x: x['combined_score'], reverse=True)
+
+    return sorted_results
+
+
+def _calculate_adaptive_weight(tfidf_norm, base_weight):
+    """
+    we calculate the adaptive weight based on the TF-IDF score
+    if we have a high TF-IDF score, we reduce the centrality weight (because in this case, the terme is in Title or Author,tf-idf is more important)
+
+    if we have a low TF-IDF score, we increase the centrality weight (because in this case, the terme is not in Title or Author,
+    tf-idf is less important,but centrality is more important)
+
+    - tfidf_norm: tf-idf normalised (0-1)
+    - base_weight
+
+    """
+    # for high TF-IDF score documents, reduce the centrality weight
+    if tfidf_norm > 0.7:
+        return base_weight * 0.5
+    elif tfidf_norm > 0.4:
+        return base_weight
+    # for low TF-IDF score documents, increase the centrality weight
+    else:
+        return min(base_weight * 1.2, 0.5)
 
 """ ------------------ Suggestion basée sur la similarité de Jaccard -------------------- """
 

@@ -1,5 +1,5 @@
 from django.urls import path
-from .views import fetch_books_from_gutendex, rank_books, regex_search_books, search_books, suggest_books, calculate_tfidf, calculate_document_similarities, calculate_centrality_scores
+from .views import fetch_books_from_gutendex,  regex_search_books, search_books, suggest_books, calculate_tfidf, calculate_document_similarities, calculate_centrality_scores
 
 urlpatterns = [
     # ----------------- Init BD avec gutendex ----------------- #
@@ -16,6 +16,6 @@ urlpatterns = [
     # ----------------- Search ----------------- #
     path("search-books/", search_books, name="search-books"),
     path("regex-search-books/", regex_search_books, name="regex-search-books"),
-    path('rank/', rank_books, name="rank-books"),
+    # path('rank/', rank_books, name="rank-books"),
     path('suggest/', suggest_books, name="suggest-books"),
 ]

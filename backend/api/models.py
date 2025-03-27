@@ -25,8 +25,8 @@ class TermDocumentIndex(models.Model):
     """Index Table - Terme ->DoC->Score TF_IDF"""
     term = models.ForeignKey(Term, on_delete=models.CASCADE)
     document = models.ForeignKey(Book, on_delete=models.CASCADE)
-    tf = models.FloatField(default=0.0)  # 词频
-    tfidf = models.FloatField(default=0.0)  # TF-IDF权重
+    tf = models.FloatField(default=0.0)
+    tfidf = models.FloatField(default=0.0)
 
     class Meta:
         # make sure that in the database, the combination of 1 term and 1 document is unique
