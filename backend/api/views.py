@@ -19,7 +19,7 @@ from django.db import transaction
 from queue import Queue
 
 
-from .models import Book, Term, TermDocumentIndex
+from .models import Book, Term, TermDocumentIndex, DocumentSimilarity, DocumentCentrality
 
 # journal
 logging.basicConfig(
@@ -627,7 +627,7 @@ def fetch_books_from_gutendex(request):
         # after importing,we can calculate tf-idf weight
         if books_imported > 0 and not skip_tfidf:
             logger.info("all book imported,start calculating tf-idf")
-            calculate_tfidf_weights()
+            # calculate_tfidf()
             logger.info("TF-IDF computation finished")
         elif skip_tfidf:
             logger.info("skip TF-IDF")
@@ -844,18 +844,301 @@ def regex_search_books(request):
     # }, safe=False)
     return JsonResponse(sorted_results,safe=False)
 
-""" ---------------- Recherche avancée par expression régulière ----------------- """
 
-# def regex_search_books(request):
-#     regex = request.GET.get("regex", "")
-#
-#     if regex:
-#         books = Book.objects.all()
-#         matched_books = [book for book in books if re.search(regex, book.title, re.IGNORECASE)]
-#         data = [{"title": b.title, "author": b.author} for b in matched_books]
-#         return JsonResponse(data, safe=False)
-#
-#     return JsonResponse({"error": "No books found"}, status=404)
+##################################################################
+#####                                                        #####
+#####             calculate Jaccard distance                 #####
+#####                                                        #####
+##################################################################
+
+def calculate_document_similarities(request=None, batch_size=100, similarity_threshold=0.1, max_workers=8):
+    """
+    calculate Jaccard similarity between all documents and store the results in the database.
+    we set a min threshold for similarity to avoid storing too many results.
+
+    - batch_size
+    - similarity_threshold
+    - max_workers: le max number of workers to use for parallel processing
+    """
+    start_time = time.time()
+
+    # get all docs
+    documents = list(Book.objects.all())
+    total_docs = len(documents)
+
+    if total_docs == 0:
+        logger.warning("no docs dispos for Jaccard similarity")
+        if request:
+            return JsonResponse({"error": "no docs dispos for Jaccard similarity"}, status=400)
+        return
+
+    # get ensemble de termes pour chaque document
+    doc_term_sets = {}
+
+    logger.info(f"start get ensemble de termes pour {total_docs} docs")
+
+    # get all term-doc indices
+    term_doc_indices = list(TermDocumentIndex.objects.all().values('document_id', 'term_id'))
+
+    # trie les termes par docs
+    for idx in term_doc_indices:
+        doc_id = idx['document_id']
+        term_id = idx['term_id']
+
+        if doc_id not in doc_term_sets:
+            doc_term_sets[doc_id] = set()
+
+        doc_term_sets[doc_id].add(term_id)
+
+    # delete acutuel similarity
+    DocumentSimilarity.objects.all().delete()
+
+    # calculer similarity parallelement
+    total_pairs = (total_docs * (total_docs - 1)) // 2  # on garde des entrie unique,on compte que 1 fois pour 2 doc
+
+    logger.info(f"start calculating {total_docs} docs's jaccard similarity（{total_pairs} pairs）using {max_workers} processus")
+
+    # task queue
+    from queue import Queue
+    result_queue = Queue()
+
+    # calculate jaccard similarity
+    def process_document_batch(batch_docs, doc_term_sets, similarity_threshold, result_queue):
+        batch_similarities = []
+        batch_processed = 0
+
+        for doc1_idx, doc2_idx in batch_docs:
+            doc1_id = documents[doc1_idx].id
+            doc2_id = documents[doc2_idx].id
+
+            if doc1_id not in doc_term_sets or doc2_id not in doc_term_sets:
+                continue
+
+            # get terms ensemble for doc
+            terms1 = doc_term_sets[doc1_id]
+            terms2 = doc_term_sets[doc2_id]
+
+            # calculate jaccard: intersection / union
+            intersection = len(terms1.intersection(terms2))
+            union = len(terms1.union(terms2))
+
+            # /0
+            if union == 0:
+                continue
+
+            similarity = intersection / union
+
+            # on garde le score quand le score est plus grand que threshold
+            if similarity >= similarity_threshold:
+                batch_similarities.append(
+                    DocumentSimilarity(
+                        document1_id=doc1_id,
+                        document2_id=doc2_id,
+                        jaccard_similarity=similarity
+                    )
+                )
+
+            batch_processed += 1
+
+        result_queue.put(batch_similarities)
+        return batch_processed
+
+    # traiter parallelement pour chaque pair de document
+    doc_pairs = []
+    for i in range(total_docs):
+        for j in range(i + 1, total_docs):
+            doc_pairs.append((i, j))
+
+    pairs_per_worker = len(doc_pairs) // max_workers + 1
+
+    # distribuer les taches
+    batches = []
+    for i in range(0, len(doc_pairs), pairs_per_worker):
+        batches.append(doc_pairs[i:i+pairs_per_worker])
+
+    processed_pairs = 0
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = []
+        for batch in batches:
+            future = executor.submit(
+                process_document_batch,
+                batch,
+                doc_term_sets,
+                similarity_threshold,
+                result_queue
+            )
+            futures.append(future)
+
+        # wait tasks
+        for future in as_completed(futures):
+            try:
+                batch_processed = future.result()
+                processed_pairs += batch_processed
+                # log: avancement
+                progress = (processed_pairs / total_pairs) * 100
+                logger.info(f"avancement: {progress:.1f}%, treated {processed_pairs}/{total_pairs} pairs")
+            except Exception as e:
+                logger.error(f"failed when calculate the jaccard similarity: {str(e)}")
+
+    all_similarities = []
+    while not result_queue.empty():
+        batch_similarities = result_queue.get()
+        all_similarities.extend(batch_similarities)
+
+    logger.info(f"start saving {len(all_similarities)} similarity donnees")
+
+    for i in range(0, len(all_similarities), batch_size):
+        batch = all_similarities[i:i+batch_size]
+        with transaction.atomic():
+            DocumentSimilarity.objects.bulk_create(batch)
+
+        # log avancement
+        progress = min((i + batch_size) / len(all_similarities), 1.0) * 100
+        logger.info(f"saving avancement: {progress:.1f}%")
+
+    total_similarities = DocumentSimilarity.objects.count()
+    duration = time.time() - start_time
+
+    logger.info(f"Jaccard similarity computation finished。created {total_similarities} entries。")
+    logger.info(f"computation time: {duration:.2f} seconds")
+
+    if request:
+        return JsonResponse({
+            "message": "Jaccard similarity computation succes",
+            "documents_processed": total_docs,
+            "total_similarities": total_similarities,
+            "similarity_threshold": similarity_threshold,
+            "max_workers": max_workers,
+            "total_duration_seconds": duration
+        })
+
+    return total_docs, total_similarities, duration
+
+
+##################################################################
+#####                                                        #####
+#####   calculate centralite(closness,betweeness,pagerank)   #####
+#####                                                        #####
+##################################################################
+
+def calculate_centrality_scores(request=None, centrality_type='closeness', min_similarity=0.1, max_workers=8):
+    """
+    Based on graph Jaccard (sommet = doc, arete = distance jaccard)
+
+    - centrality_type: 'closeness', 'betweenness', 或or'pagerank'
+    - min_similarity: threshold of distance
+    - max_workers: parallele processus
+    """
+    start_time = time.time()
+
+    # creer centralite non-oriente graphe
+    G = nx.Graph()
+
+    # add sommets
+    for book in Book.objects.all():
+        G.add_node(book.id, title=book.title, author=book.author)
+
+    # add aretes
+    similarities = DocumentSimilarity.objects.filter(jaccard_similarity__gte=min_similarity)
+    edge_count = 0
+
+    for sim in similarities:
+        # le poids ici est l'inverse du Jaccard distance,car le plus similaire,la distance plus courte
+        # poids = 1/jaccard_distance
+        weight = 1.0 / sim.jaccard_similarity if sim.jaccard_similarity > 0 else float('inf')
+        G.add_edge(sim.document1_id, sim.document2_id, weight=weight, similarity=sim.jaccard_similarity)
+        edge_count += 1
+
+    logger.info(f"created {G.number_of_nodes()} sommets et {edge_count} aretes dans le graphe")
+
+    # calculate centralite based on le type (closeness,pagerank,betweeness)
+    centrality_scores = {}
+
+    try:
+        if centrality_type == 'closeness':
+            # closeness
+            logger.info(f"start calculating closeness，using {max_workers} processus...")
+
+            # parallele computation
+            def calculate_node_closeness(node, graph):
+                try:
+                    closeness = nx.closeness_centrality(graph, u=node, distance='weight')
+                    return node, closeness
+                except Exception as e:
+                    logger.error(f"failed {node} computation of closeness: {str(e)}")
+                    return node, 0.0
+
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                futures = []
+                for node in G.nodes():
+                    futures.append(executor.submit(calculate_node_closeness, node, G))
+
+                for future in as_completed(futures):
+                    try:
+                        node, score = future.result()
+                        centrality_scores[node] = score
+                    except Exception as e:
+                        logger.error(f"failed computation of closeness: {str(e)}")
+
+        elif centrality_type == 'betweenness':
+            # betweenness
+            logger.info(f"computation betweenness，using {max_workers} processus...")
+            try:
+                centrality_scores = nx.betweenness_centrality(G, weight='weight', k=None, normalized=True,
+                                                              endpoints=False, seed=None, parallel=True,
+                                                              n_jobs=max_workers)
+            except TypeError:
+                logger.warning("computation parallel not supported，back to sequential")
+                centrality_scores = nx.betweenness_centrality(G, weight='weight')
+
+        elif centrality_type == 'pagerank':
+            # PageRank
+            logger.info("computation PageRank...")
+            # pour pagerank,on utilise similarity mais pas distance
+            centrality_scores = nx.pagerank(G)
+        else:
+            logger.error(f"type de centralite unknown: {centrality_type}")
+            if request:
+                return JsonResponse({"error": f"type de centralite unknown: {centrality_type}"}, status=400)
+            return
+    except Exception as e:
+        logger.error(f"failed computation of centralite: {str(e)}")
+        if request:
+            return JsonResponse({"error": f"failed computation of centralite: {str(e)}"}, status=500)
+        return
+
+    # delete actual document centralite donnees
+    DocumentCentrality.objects.filter(centrality_type=centrality_type).delete()
+
+    # save donnee
+    centrality_records = []
+    for book_id, score in centrality_scores.items():
+        centrality_records.append(
+            DocumentCentrality(
+                document_id=book_id,
+                centrality_type=centrality_type,
+                score=score
+            )
+        )
+
+    with transaction.atomic():
+        DocumentCentrality.objects.bulk_create(centrality_records)
+
+    duration = time.time() - start_time
+
+    logger.info(f"{centrality_type.capitalize()} computation finished in {duration:.2f} second")
+
+    if request:
+        return JsonResponse({
+            "message": f"{centrality_type.capitalize()} computation finished",
+            "documents_processed": len(centrality_scores),
+            "centrality_type": centrality_type,
+            "min_similarity": min_similarity,
+            "max_workers": max_workers,
+            "total_duration_seconds": duration
+        })
+
+    return len(centrality_scores), duration
 
 """ ----------------- Classement des livres avec PageRank -----------------"""
 

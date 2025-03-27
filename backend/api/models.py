@@ -35,3 +35,37 @@ class TermDocumentIndex(models.Model):
             models.Index(fields=['term']),
             models.Index(fields=['document']),
         ]
+
+
+class DocumentSimilarity(models.Model):
+    """Jaccard - Similarity entre 2 doc"""
+    document1 = models.ForeignKey(Book, related_name='similarities_as_doc1', on_delete=models.CASCADE)
+    document2 = models.ForeignKey(Book, related_name='similarities_as_doc2', on_delete=models.CASCADE)
+    jaccard_similarity = models.FloatField(default=0.0) # Jaccard distance
+
+    class Meta:
+        unique_together = ('document1', 'document2')
+        indexes = [
+            models.Index(fields=['document1']),
+            models.Index(fields=['document2']),
+        ]
+
+    def __str__(self):
+        return f"{self.document1.title} - {self.document2.title}: {self.jaccard_similarity}"
+
+
+class DocumentCentrality(models.Model):
+    """Centrality entre des docs - closeness'"""
+    document = models.ForeignKey(Book, on_delete=models.CASCADE)
+    centrality_type = models.CharField(max_length=20)  # 'closeness', 'betweenness', 'pagerank'
+    score = models.FloatField(default=0.0)
+
+    class Meta:
+        unique_together = ('document', 'centrality_type')
+        indexes = [
+            models.Index(fields=['document']),
+            models.Index(fields=['centrality_type']),
+        ]
+
+    def __str__(self):
+        return f"{self.document.title} - {self.centrality_type}: {self.score}"
