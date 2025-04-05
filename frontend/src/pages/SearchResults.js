@@ -73,7 +73,7 @@ function SearchResults() {
           </div>
       ) : (
           //result == vide
-          results.length === 0 && !error && (
+          results && results.length === 0 && !error && (
               <p className="text-center text-gray-500 mt-6">
                 Aucun livre trouvé pour "<span className="font-bold">{query}</span>". <br />
                 Essayez un autre mot-clé ou une variante !
@@ -82,7 +82,7 @@ function SearchResults() {
       )}
 
       <div className="grid grid-cols-3 gap-6 mt-6">
-        {results.map((book, index) => (
+        {results && results.map((book, index) => (
             <BookCard key={index} book={book} />
         ))}
       </div>

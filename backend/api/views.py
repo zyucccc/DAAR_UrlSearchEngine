@@ -493,6 +493,36 @@ def calculate_document_similarities(request=None, batch_size=100, similarity_thr
 
         doc_term_sets[doc_id].add(term_id)
 
+    # pre-load all TF-IDF values to memory
+    logger.info("starting to pre-load all TF-IDF values to memory")
+    term_doc_weights = {}
+
+    # get all term-document pairs and their TF-IDF values
+    all_term_document_pairs = TermDocumentIndex.objects.all().values('term_id', 'document_id', 'tfidf')
+
+    logger.info(f"founded{all_term_document_pairs.count()}documents and {len(doc_term_sets)} terms")
+
+    batch_size_load = 10000
+    total_loaded = 0
+
+    for i in range(0, all_term_document_pairs.count(), batch_size_load):
+        batch = all_term_document_pairs[i:i+batch_size_load]
+
+        for record in batch:
+            term_id = record['term_id']
+            doc_id = record['document_id']
+            tfidf = record['tfidf']
+
+            if term_id not in term_doc_weights:
+                term_doc_weights[term_id] = {}
+
+            term_doc_weights[term_id][doc_id] = tfidf
+
+        total_loaded += len(batch)
+        logger.info(f"loaded {total_loaded}/{all_term_document_pairs.count()} TF-IDF values ({(total_loaded/all_term_document_pairs.count()*100):.1f}%)")
+
+    logger.info(f"succes loaded {len(term_doc_weights)} TF-IDF")
+
     # delete acutuel similarity
     DocumentSimilarity.objects.all().delete()
 
@@ -506,7 +536,7 @@ def calculate_document_similarities(request=None, batch_size=100, similarity_thr
     result_queue = Queue()
 
     # calculate jaccard similarity
-    def process_document_batch(batch_docs, doc_term_sets, similarity_threshold, result_queue):
+    def process_document_batch(batch_docs, doc_term_sets, term_doc_weights, similarity_threshold, result_queue):
         batch_similarities = []
         batch_processed = 0
 
@@ -521,25 +551,79 @@ def calculate_document_similarities(request=None, batch_size=100, similarity_thr
             terms1 = doc_term_sets[doc1_id]
             terms2 = doc_term_sets[doc2_id]
 
-            # calculate jaccard: intersection / union
-            intersection = len(terms1.intersection(terms2))
-            union = len(terms1.union(terms2))
+            # find common terms
+            common_terms = terms1.intersection(terms2)
 
-            # /0
-            if union == 0:
+            if not common_terms:
+                batch_processed += 1
                 continue
 
-            similarity = intersection / union
+            # get tf-idf for common terms
+            numerator = 0.0
+            denominator = 0.0
+
+            # indices = TermDocumentIndex.objects.filter(
+            #     term_id__in=common_terms,
+            #     document_id__in=[doc1_id, doc2_id]
+            # ).values('term_id', 'document_id', 'tfidf')
+
+            # dictionary to store term weights
+            # term_weights = {}
+            # for idx in indices:
+            #     term_id = idx['term_id']
+            #     doc_id = idx['document_id']
+            #     tfidf = idx['tfidf']
+            #
+            #     if term_id not in term_weights:
+            #         term_weights[term_id] = {}
+            #
+            #     term_weights[term_id][doc_id] = tfidf
+
+            # calculer le numérateur et le dénominateur
+            for term_id in common_terms:
+                if term_id in term_doc_weights and doc1_id in term_doc_weights[term_id] and doc2_id in term_doc_weights[term_id]:
+                    k1 = term_doc_weights[term_id][doc1_id]
+                    k2 = term_doc_weights[term_id][doc2_id]
+
+                    max_k = max(k1, k2)
+                    min_k = min(k1, k2)
+
+                    numerator += (max_k - min_k)
+                    denominator += max_k
+
+            # jaccard distance
+            if denominator > 0:
+                jaccard_distance = numerator / denominator
+                jaccard_similarity = 1.0 - jaccard_distance  # similarity = 1 - distance
+
+                if jaccard_similarity >= similarity_threshold:
+                    batch_similarities.append(
+                        DocumentSimilarity(
+                            document1_id=doc1_id,
+                            document2_id=doc2_id,
+                            jaccard_similarity=jaccard_similarity
+                        )
+                    )
+
+            # calculate jaccard: intersection / union
+            # intersection = len(terms1.intersection(terms2))
+            # union = len(terms1.union(terms2))
+
+            # /0
+            # if union == 0:
+            #     continue
+            #
+            # similarity = intersection / union
 
             # on garde le score quand le score est plus grand que threshold
-            if similarity >= similarity_threshold:
-                batch_similarities.append(
-                    DocumentSimilarity(
-                        document1_id=doc1_id,
-                        document2_id=doc2_id,
-                        jaccard_similarity=similarity
-                    )
-                )
+            # if similarity >= similarity_threshold:
+            #     batch_similarities.append(
+            #         DocumentSimilarity(
+            #             document1_id=doc1_id,
+            #             document2_id=doc2_id,
+            #             jaccard_similarity=similarity
+            #         )
+            #     )
 
             batch_processed += 1
 
@@ -567,6 +651,7 @@ def calculate_document_similarities(request=None, batch_size=100, similarity_thr
                 process_document_batch,
                 batch,
                 doc_term_sets,
+                term_doc_weights,
                 similarity_threshold,
                 result_queue
             )
@@ -624,7 +709,7 @@ def calculate_document_similarities(request=None, batch_size=100, similarity_thr
 #####                                                        #####
 ##################################################################
 
-def calculate_centrality_scores(request=None, centrality_type='closeness', min_similarity=0.1, max_workers=8):
+def calculate_centrality_scores(request=None, centrality_type='closeness', min_similarity=0.5, max_workers=8):
     """
     Based on graph Jaccard (sommet = doc, arete = distance jaccard)
 
@@ -647,8 +732,10 @@ def calculate_centrality_scores(request=None, centrality_type='closeness', min_s
 
     for sim in similarities:
         # le poids ici est l'inverse du Jaccard distance,car le plus similaire,la distance plus courte
-        # poids = 1/jaccard_distance
-        weight = 1.0 / sim.jaccard_similarity if sim.jaccard_similarity > 0 else float('inf')
+        # poids = 1/jaccard_similarity
+        # weight = 1.0 / sim.jaccard_similarity if sim.jaccard_similarity > 0 else float('inf')
+        # poids = 1 - jaccard_similarity
+        weight = 1.0 - sim.jaccard_similarity if sim.jaccard_similarity < 1 else 0.0
         G.add_edge(sim.document1_id, sim.document2_id, weight=weight, similarity=sim.jaccard_similarity)
         edge_count += 1
 
@@ -1098,3 +1185,138 @@ def get_book_detail(request, book_id):
     except Exception as e:
         logger.error(f"Error fetching book detail: {str(e)}")
         return JsonResponse({"error": f"Erreur serveur: {str(e)}"}, status=500)
+
+
+##################################################################
+#####                                                        #####
+#####               reduce taille of indextable              #####
+#####                                                        #####
+##################################################################
+def prune_term_document_index(request=None, terms_to_keep=1000, batch_size=100, max_workers=8):
+    """
+    Prune the term-document index to keep only the top N terms with highest TF-IDF scores
+    for each document. Uses parallel processing to improve performance.
+    """
+    start_time = time.time()
+
+    logger.info(f"Starting parallel index pruning with {max_workers} workers, keeping top {terms_to_keep} terms per document...")
+
+    # Get all document IDs
+    document_ids = list(Book.objects.values_list('id', flat=True))
+    total_docs = len(document_ids)
+
+    # Statistics before pruning
+    total_indices_before = TermDocumentIndex.objects.count()
+
+    # Define worker function to process a batch of documents
+    def process_document_batch(doc_ids_batch):
+        batch_indices_to_keep = []
+        processed_count = 0
+
+        for doc_id in doc_ids_batch:
+            # Get all index records for this document, ordered by TF-IDF score descending
+            doc_indices = list(TermDocumentIndex.objects.filter(
+                document_id=doc_id
+            ).order_by('-tfidf').values_list('id', flat=True))
+
+            # If there are more records than we want to keep
+            if len(doc_indices) > terms_to_keep:
+                # Keep only the highest scoring terms
+                batch_indices_to_keep.extend(doc_indices[:terms_to_keep])
+            else:
+                # If there are fewer records than the limit, keep all of them
+                batch_indices_to_keep.extend(doc_indices)
+
+            processed_count += 1
+
+        return batch_indices_to_keep, processed_count
+
+    # Divide documents into batches for parallel processing
+    doc_batches = []
+    docs_per_worker = (total_docs + max_workers - 1) // max_workers  # Ceiling division
+
+    for i in range(0, total_docs, docs_per_worker):
+        doc_batches.append(document_ids[i:i+docs_per_worker])
+
+    logger.info(f"Split {total_docs} documents into {len(doc_batches)} batches for processing")
+
+    # Process batches in parallel
+    indices_to_keep = []
+    total_processed = 0
+
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        # Submit all tasks
+        future_to_batch = {executor.submit(process_document_batch, batch): i
+                           for i, batch in enumerate(doc_batches)}
+
+        # Process results as they complete
+        for future in as_completed(future_to_batch):
+            batch_idx = future_to_batch[future]
+            try:
+                batch_indices, batch_processed = future.result()
+                indices_to_keep.extend(batch_indices)
+                total_processed += batch_processed
+
+                # Log progress
+                progress = (total_processed / total_docs) * 100
+                logger.info(f"Batch {batch_idx+1}/{len(doc_batches)} completed. Overall progress: {progress:.1f}% ({total_processed}/{total_docs} documents)")
+
+            except Exception as e:
+                logger.error(f"Error processing batch {batch_idx}: {str(e)}")
+
+    logger.info(f"Determined {len(indices_to_keep)} index entries to keep. Starting deletion process...")
+
+    all_indices = set(TermDocumentIndex.objects.values_list('id', flat=True))
+    indices_to_keep_set = set(indices_to_keep)
+    indices_to_delete = list(all_indices - indices_to_keep_set)
+
+    logger.info(f"Identified {len(indices_to_delete)} index entries to delete. Starting batch deletion...")
+
+    delete_batch_size = 500  # limit of sqlite: 1000
+    deleted_count = 0
+
+    for i in range(0, len(indices_to_delete), delete_batch_size):
+        batch = indices_to_delete[i:i+delete_batch_size]
+        with transaction.atomic():
+            batch_deleted = TermDocumentIndex.objects.filter(id__in=batch).delete()[0]
+            deleted_count += batch_deleted
+
+        progress = (i + len(batch)) / len(indices_to_delete) * 100
+        logger.info(f"Deleted batch {i//delete_batch_size + 1}/{(len(indices_to_delete) + delete_batch_size - 1)//delete_batch_size}. "
+                    f"Progress: {progress:.1f}% ({i + len(batch)}/{len(indices_to_delete)})")
+
+    # Statistics after pruning
+    total_indices_after = TermDocumentIndex.objects.count()
+    duration = time.time() - start_time
+    percentage_reduced = ((total_indices_before - total_indices_after) / total_indices_before) * 100 if total_indices_before > 0 else 0
+
+    logger.info(f"Parallel index pruning completed in {duration:.2f} seconds")
+    logger.info(f"Index entries: {total_indices_before} before, {total_indices_after} after")
+    logger.info(f"Deleted {deleted_count} index records, reduced by {percentage_reduced:.2f}%")
+
+    result = {
+        "message": "Parallel index pruning completed",
+        "documents_processed": total_processed,
+        "workers_used": max_workers,
+        "indices_before": total_indices_before,
+        "indices_after": total_indices_after,
+        "indices_deleted": deleted_count,
+        "percentage_reduced": percentage_reduced,
+        "duration_seconds": duration
+    }
+
+    if request:
+        return JsonResponse(result)
+
+    return result
+
+def prune_index(request):
+    """
+    API endpoint to prune the term-document index, keeping only the top N terms
+    with highest TF-IDF scores for each document.
+    """
+    terms_to_keep = int(request.GET.get('terms_to_keep', '1000'))
+    batch_size = int(request.GET.get('batch_size', '100'))
+    max_workers = int(request.GET.get('max_workers', '8'))
+
+    return prune_term_document_index(request, terms_to_keep, batch_size, max_workers)
